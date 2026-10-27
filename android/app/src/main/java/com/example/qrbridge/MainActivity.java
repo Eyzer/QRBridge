@@ -22,9 +22,9 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import com.google.zxing.ResultPoint;
-import com.journeyapps.zxing.BarcodeCallback;
-import com.journeyapps.zxing.BarcodeResult;
-import com.journeyapps.zxing.DecoratedBarcodeView;
+import com.journeyapps.barcodescanner.BarcodeCallback;
+import com.journeyapps.barcodescanner.BarcodeResult;
+import com.journeyapps.barcodescanner.DecoratedBarcodeView;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
