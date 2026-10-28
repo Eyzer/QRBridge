@@ -16,7 +16,7 @@
         android:gravity="center"
         android:layout_marginTop="8dp" />
 
-    <com.journeyapps.zxing.DecoratedBarcodeView
+    <androidx.camera.view.PreviewView
         android:id="@+id/barcode_scanner"
         android:layout_width="match_parent"
         android:layout_height="320dp"

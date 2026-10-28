@@ -3,7 +3,11 @@ package com.example.qrbridge;
 import android.Manifest;
 import android.content.ContentValues;
 import android.content.pm.PackageManager;
-import android.graphics.Color;
+import android.graphics.Bitmap;
+import android.graphics.ImageFormat;
+import android.graphics.Rect;
+import android.graphics.YuvImage;
+import android.media.Image;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -18,13 +22,23 @@ import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageProxy;
+import androidx.camera.core.Preview;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.view.PreviewView;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
-import com.google.zxing.ResultPoint;
-import com.journeyapps.barcodescanner.BarcodeCallback;
-import com.journeyapps.barcodescanner.BarcodeResult;
-import com.journeyapps.barcodescanner.DecoratedBarcodeView;
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.BinaryBitmap;
+import com.google.zxing.DecodeHintType;
+import com.google.zxing.MultiFormatReader;
+import com.google.zxing.PlanarYUVLuminanceSource;
+import com.google.zxing.RGBLuminanceSource;
+import com.google.zxing.Result;
+import com.google.zxing.common.HybridBinarizer;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -34,10 +48,14 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
 import java.util.zip.CRC32;
 import java.util.zip.Inflater;
 
@@ -45,11 +63,14 @@ public class MainActivity extends AppCompatActivity {
 
     private static final int CAMERA_REQ = 100;
 
-    private DecoratedBarcodeView scanner;
+    private PreviewView previewView;
     private TextView tvStatus, tvFp, tvProgress, tvInfo;
     private ProgressBar bar;
     private LinearLayout grid;
     private Button btnClear, btnSave;
+
+    private final MultiFormatReader reader = new MultiFormatReader();
+    private long lastScan = 0;
 
     private final Map<Integer, String> chunks = new HashMap<>();
     private String fp = null;
@@ -59,22 +80,12 @@ public class MainActivity extends AppCompatActivity {
     private long rxSize = 0;
     private byte[] lastFile = null;
 
-    private final BarcodeCallback cb = new BarcodeCallback() {
-        @Override
-        public void barcodeResult(BarcodeResult r) {
-            if (r != null && r.getText() != null) handle(r.getText());
-        }
-
-        @Override
-        public void possibleResultPoints(List<ResultPoint> points) { }
-    };
-
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         setContentView(R.layout.activity_main);
 
-        scanner = findViewById(R.id.barcode_scanner);
+        previewView = findViewById(R.id.barcode_scanner);
         tvStatus = findViewById(R.id.tv_status);
         tvFp = findViewById(R.id.tv_fp);
         tvProgress = findViewById(R.id.tv_progress);
@@ -83,6 +94,10 @@ public class MainActivity extends AppCompatActivity {
         grid = findViewById(R.id.grid);
         btnClear = findViewById(R.id.btn_clear);
         btnSave = findViewById(R.id.btn_save);
+
+        EnumMap<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
+        hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
+        reader.setHints(hints);
 
         loadState();
         updateUI();
@@ -94,40 +109,113 @@ public class MainActivity extends AppCompatActivity {
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED) {
-            startScan();
+            startCamera();
         } else {
             ActivityCompat.requestPermissions(this,
                     new String[]{Manifest.permission.CAMERA}, CAMERA_REQ);
         }
     }
 
-    private void startScan() {
-        scanner.resume();
-        scanner.decodeContinuous(cb);
+    private void startCamera() {
+        try {
+            Executor ex = ContextCompat.getMainExecutor(this);
+            ProcessCameraProvider.getInstance(this).addListener(() -> {
+                try {
+                    ProcessCameraProvider provider = ProcessCameraProvider.getInstance(this).get();
+                    Preview preview = new Preview.Builder().build();
+                    preview.setSurfaceProvider(previewView.getSurfaceProvider());
+
+                    ImageAnalysis analysis = new ImageAnalysis.Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .build();
+                    analysis.setAnalyzer(ex, this::decodeFrame);
+
+                    CameraSelector sel = new CameraSelector.Builder()
+                            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                            .build();
+                    provider.unbindAll();
+                    provider.bindToLifecycle(this, sel, preview, analysis);
+                    tvStatus.setText("对准二维码");
+                } catch (Exception e) {
+                    toast("相机启动失败: " + e.getMessage(), true);
+                }
+            }, ex);
+        } catch (Exception e) {
+            toast("相机初始化失败: " + e.getMessage(), true);
+        }
+    }
+
+    private void decodeFrame(ImageProxy image) {
+        long now = System.currentTimeMillis();
+        if (now - lastScan < 160) {
+            image.close();
+            return;
+        }
+        lastScan = now;
+        try {
+            byte[] nv21 = yuv420ToNV21(image);
+            int w = image.getWidth(), h = image.getHeight();
+            YuvImage yuv = new YuvImage(nv21, ImageFormat.NV21, w, h, null);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            yuv.compressToJpeg(new Rect(0, 0, w, h), 90, baos);
+            Bitmap bmp = BitmapFactory.decodeByteArray(baos.toByteArray(), 0, baos.size());
+            if (bmp != null) {
+                int[] px = new int[w * h];
+                bmp.getPixels(px, 0, w, 0, 0, w, h);
+                RGBLuminanceSource src = new RGBLuminanceSource(w, h, px);
+                BinaryBitmap bb = new BinaryBitmap(new HybridBinarizer(src));
+                try {
+                    Result r = reader.decodeWithState(bb);
+                    String t = r.getText();
+                    if (t != null && !t.isEmpty()) handle(t);
+                } catch (Exception ignore) {
+                }
+                bmp.recycle();
+            }
+        } catch (Exception ignore) {
+        } finally {
+            image.close();
+        }
+    }
+
+    private static byte[] yuv420ToNV21(ImageProxy image) {
+        int w = image.getWidth(), h = image.getHeight();
+        ByteBuffer yB = image.getPlanes()[0].getBuffer();
+        ByteBuffer uB = image.getPlanes()[1].getBuffer();
+        ByteBuffer vB = image.getPlanes()[2].getBuffer();
+        int yRow = image.getPlanes()[0].getRowStride();
+        int uvRow = image.getPlanes()[1].getRowStride();
+        int uvPix = image.getPlanes()[1].getPixelStride();
+        int ySize = w * h;
+        byte[] out = new byte[ySize + w * h / 2];
+        yB.rewind();
+        if (yRow == w) {
+            yB.get(out, 0, ySize);
+        } else {
+            for (int y = 0; y < h; y++) {
+                yB.get(out, y * w, w);
+                yB.position(Math.min(yB.limit(), yB.position() + (yRow - w)));
+            }
+        }
+        int pos = ySize;
+        for (int y = 0; y < h / 2; y++) {
+            for (int x = 0; x < w / 2; x++) {
+                int uOff = y * uvRow + x * uvPix;
+                int vOff = y * image.getPlanes()[2].getRowStride() + x * image.getPlanes()[2].getPixelStride();
+                out[pos++] = vB.get(vOff);
+                out[pos++] = uB.get(uOff);
+            }
+        }
+        return out;
     }
 
     @Override
     public void onRequestPermissionsResult(int req, @NonNull String[] p, @NonNull int[] g) {
         if (req == CAMERA_REQ && g.length > 0 && g[0] == PackageManager.PERMISSION_GRANTED) {
-            startScan();
+            startCamera();
         } else {
             Toast.makeText(this, "需要摄像头权限才能扫码", Toast.LENGTH_LONG).show();
         }
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                == PackageManager.PERMISSION_GRANTED) {
-            scanner.resume();
-        }
-    }
-
-    @Override
-    protected void onPause() {
-        scanner.pause();
-        super.onPause();
     }
 
     // ===== 处理扫到的二维码 =====
@@ -232,7 +320,6 @@ public class MainActivity extends AppCompatActivity {
 
     private void saveFile(byte[] data, String name) {
         name = safeName(name);
-        // 优先用 MediaStore 写入「下载 / QRBridge」
         try {
             ContentValues v = new ContentValues();
             v.put(MediaStore.Downloads.DISPLAY_NAME, name);
@@ -247,7 +334,6 @@ public class MainActivity extends AppCompatActivity {
                 return;
             }
         } catch (Exception ignore) { }
-        // 兜底：写入应用私有下载目录
         try {
             File dir = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "QRBridge");
             dir.mkdirs();
@@ -468,8 +554,8 @@ public class MainActivity extends AppCompatActivity {
             lp.setMargins(4, 4, 4, 4);
             t.setLayoutParams(lp);
             boolean ok = chunks.containsKey(i);
-            t.setBackgroundColor(ok ? Color.parseColor("#27ae60") : Color.parseColor("#ecf0f1"));
-            t.setTextColor(ok ? Color.WHITE : Color.DKGRAY);
+            t.setBackgroundColor(ok ? android.graphics.Color.parseColor("#27ae60") : android.graphics.Color.parseColor("#ecf0f1"));
+            t.setTextColor(ok ? android.graphics.Color.WHITE : android.graphics.Color.DKGRAY);
             grid.addView(t);
         }
         if (fnChunk != null) {
@@ -481,8 +567,8 @@ public class MainActivity extends AppCompatActivity {
                     LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
             lp.setMargins(4, 4, 4, 4);
             t.setLayoutParams(lp);
-            t.setBackgroundColor(Color.parseColor("#1a5276"));
-            t.setTextColor(Color.WHITE);
+            t.setBackgroundColor(android.graphics.Color.parseColor("#1a5276"));
+            t.setTextColor(android.graphics.Color.WHITE);
             grid.addView(t);
         }
     }
