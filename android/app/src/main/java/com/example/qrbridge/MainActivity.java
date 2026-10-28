@@ -80,6 +80,7 @@ public class MainActivity extends AppCompatActivity {
     private String rxName = "";
     private long rxSize = 0;
     private byte[] lastFile = null;
+    private String lastRaw = "";
 
     @Override
     protected void onCreate(Bundle b) {
@@ -227,6 +228,10 @@ public class MainActivity extends AppCompatActivity {
             int z = s.lastIndexOf('}');
             if (a < 0 || z < 0) return;
             s = s.substring(a, z + 1);
+
+            // 同一张二维码在画面里停留会反复解码：直接静默忽略，避免刷屏“分片X已有”
+            if (s.equals(lastRaw)) return;
+
             JSONObject c = new JSONObject(s);
 
             if ("fn".equals(c.optString("t"))) {
@@ -250,9 +255,10 @@ public class MainActivity extends AppCompatActivity {
                 total = (int) tc;
                 rxName = decodeName(n);
                 rxSize = sz;
+                lastRaw = s;
                 saveState();
                 toast("文件名分片已收");
-                tvStatus.setText("文件名: " + rxName);
+                tvStatus.setText("文件名: " + rxName + "  (共 " + total + " 片)");
             } else {
                 int i = c.getInt("t");          // 总分片数
                 int idx = c.getInt("i");         // 分片索引
@@ -271,13 +277,17 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
                 if (chunks.containsKey(idx)) {
-                    toast("分片" + (idx + 1) + "已有");
+                    lastRaw = s;                 // 已收过，静默忽略
                     return;
                 }
                 if (total == 0) total = i;
                 chunks.put(idx, d);
+                lastRaw = s;
                 saveState();
-                toast("数据 " + (idx + 1) + "/" + i);
+                int got = chunks.size();
+                tvStatus.setText("已收 " + (idx + 1) + "/" + total
+                        + " 片   下一待收第 " + (got + 1) + " 片");
+                toast("收到分片 " + (idx + 1) + "/" + total);
             }
             updateUI();
             checkDone();
@@ -520,6 +530,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void clearAll() {
         chunks.clear();
+        lastRaw = "";
         fnChunk = null;
         fp = null;
         total = 0;
