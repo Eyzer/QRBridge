@@ -49,6 +49,16 @@
         android:gravity="center"
         android:layout_marginTop="6dp" />
 
+    <TextView
+        android:id="@+id/tv_heart"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="帧 0 · 最近解码 -s前"
+        android:textColor="#64748b"
+        android:textSize="11sp"
+        android:gravity="center"
+        android:layout_marginTop="2dp" />
+
     <ProgressBar
         android:id="@+id/bar"
         android:layout_width="match_parent"

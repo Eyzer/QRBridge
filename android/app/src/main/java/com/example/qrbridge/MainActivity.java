@@ -3,17 +3,11 @@ package com.example.qrbridge;
 import android.Manifest;
 import android.content.ContentValues;
 import android.content.pm.PackageManager;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.graphics.ImageFormat;
-import android.graphics.Rect;
-import android.graphics.YuvImage;
 import android.media.Image;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
-import android.util.Size;
 import android.provider.MediaStore;
 import android.widget.Button;
 import android.widget.HorizontalScrollView;
@@ -38,14 +32,12 @@ import com.google.zxing.BinaryBitmap;
 import com.google.zxing.DecodeHintType;
 import com.google.zxing.MultiFormatReader;
 import com.google.zxing.PlanarYUVLuminanceSource;
-import com.google.zxing.RGBLuminanceSource;
 import com.google.zxing.Result;
 import com.google.zxing.common.HybridBinarizer;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -55,9 +47,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.EnumMap;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.zip.CRC32;
 import java.util.zip.Inflater;
 
@@ -66,7 +58,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int CAMERA_REQ = 100;
 
     private PreviewView previewView;
-    private TextView tvStatus, tvFp, tvProgress, tvInfo;
+    private TextView tvStatus, tvFp, tvProgress, tvInfo, tvHeart;
     private ProgressBar bar;
     private LinearLayout grid;
     private Button btnClear, btnSave;
@@ -75,6 +67,13 @@ public class MainActivity extends AppCompatActivity {
     private final EnumMap<DecodeHintType, Object> hintsFast = new EnumMap<>(DecodeHintType.class);
     private final EnumMap<DecodeHintType, Object> hintsHard = new EnumMap<>(DecodeHintType.class);
     private long lastScan = 0;
+
+    // 后台单线程执行分析，避免阻塞相机/主线程导致部分机型（如 VIVO/originOS）停止送帧
+    private ExecutorService analyzerExecutor;
+    private byte[] nv21Buf = null;            // 复用的 YUV 缓冲，避免每帧分配 4.8MB
+    private long frameCount = 0;
+    private long lastFrameTs = 0;
+    private long lastDecodeTs = 0;
 
     private final Map<Integer, String> chunks = new HashMap<>();
     private String fp = null;
@@ -95,6 +94,7 @@ public class MainActivity extends AppCompatActivity {
         tvFp = findViewById(R.id.tv_fp);
         tvProgress = findViewById(R.id.tv_progress);
         tvInfo = findViewById(R.id.tv_info);
+        tvHeart = findViewById(R.id.tv_heart);
         bar = findViewById(R.id.bar);
         grid = findViewById(R.id.grid);
         btnClear = findViewById(R.id.btn_clear);
@@ -126,7 +126,8 @@ public class MainActivity extends AppCompatActivity {
 
     private void startCamera() {
         try {
-            Executor ex = ContextCompat.getMainExecutor(this);
+            // 后台线程执行扫码分析，主线程只负责预览与 UI
+            analyzerExecutor = Executors.newSingleThreadExecutor();
             ProcessCameraProvider.getInstance(this).addListener(() -> {
                 try {
                     ProcessCameraProvider provider = ProcessCameraProvider.getInstance(this).get();
@@ -134,26 +135,27 @@ public class MainActivity extends AppCompatActivity {
                     preview.setSurfaceProvider(previewView.getSurfaceProvider());
 
                     ImageAnalysis analysis = new ImageAnalysis.Builder()
-                            .setTargetResolution(new Size(1280, 960))
+                            .setTargetResolution(new android.util.Size(1280, 960))
                             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                             .build();
-                    analysis.setAnalyzer(ex, this::decodeFrame);
+                    analysis.setAnalyzer(analyzerExecutor, this::decodeFrame);
 
                     CameraSelector sel = new CameraSelector.Builder()
                             .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                             .build();
                     provider.unbindAll();
                     provider.bindToLifecycle(this, sel, preview, analysis);
-                    tvStatus.setText("对准二维码");
+                    runUi(() -> tvStatus.setText("对准二维码"));
                 } catch (Exception e) {
                     toast("相机启动失败: " + e.getMessage(), true);
                 }
-            }, ex);
+            }, ContextCompat.getMainExecutor(this));
         } catch (Exception e) {
             toast("相机初始化失败: " + e.getMessage(), true);
         }
     }
 
+    // 关键修复：立刻关闭相机 ImageProxy（释放缓冲），再从本地副本解码，杜绝部分机型“送帧停摆”
     private void decodeFrame(ImageProxy image) {
         long now = System.currentTimeMillis();
         if (now - lastScan < 120) {
@@ -161,37 +163,50 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         lastScan = now;
+        frameCount++;
+        lastFrameTs = now;
+
+        byte[] data;
+        int w, h;
         try {
-            int w = image.getWidth(), h = image.getHeight();
-            byte[] nv21 = yuv420ToNV21(image);
-            int ySize = w * h;
-            // 二维码是灰度图，只需亮度通道：直接从 Y 平面构造灰度，避免 JPEG 有损压缩糊掉高密度码
-            int[] px = new int[ySize];
-            for (int i = 0; i < ySize; i++) {
-                int Y = nv21[i] & 0xff;
-                px[i] = (0xff000000) | (Y << 16) | (Y << 8) | Y;
-            }
-            RGBLuminanceSource src = new RGBLuminanceSource(w, h, px);
-            // 先快速解；失败再用 TRY_HARDER 兜底（高密度码必备）
+            w = image.getWidth();
+            h = image.getHeight();
+            data = yuv420ToNV21(image);   // 写入复用缓冲，不每帧 new 大数组
+        } catch (Exception e) {
+            image.close();
+            updateHeart();
+            return;
+        }
+        image.close();   // 立即释放相机缓冲
+
+        try {
+            PlanarYUVLuminanceSource src = new PlanarYUVLuminanceSource(
+                    data, w, h, 0, 0, w, h, false);
             try {
                 Result r = reader.decode(new BinaryBitmap(new HybridBinarizer(src)), hintsFast);
-                String t = r.getText();
-                if (t != null && !t.isEmpty()) handle(t);
+                onResult(r);
             } catch (Exception e1) {
                 try {
                     Result r = reader.decode(new BinaryBitmap(new HybridBinarizer(src)), hintsHard);
-                    String t = r.getText();
-                    if (t != null && !t.isEmpty()) handle(t);
+                    onResult(r);
                 } catch (Exception ignore) {
                 }
             }
         } catch (Exception ignore) {
-        } finally {
-            image.close();
+        }
+        updateHeart();
+    }
+
+    private void onResult(Result r) {
+        String t = r.getText();
+        if (t != null && !t.isEmpty()) {
+            lastDecodeTs = System.currentTimeMillis();
+            handle(t);
         }
     }
 
-    private static byte[] yuv420ToNV21(ImageProxy image) {
+    // YUV420 -> NV21（复用 nv21Buf），Y 平面 stride 规整为 w，兼容各类机型
+    private byte[] yuv420ToNV21(ImageProxy image) {
         int w = image.getWidth(), h = image.getHeight();
         ByteBuffer yB = image.getPlanes()[0].getBuffer();
         ByteBuffer uB = image.getPlanes()[1].getBuffer();
@@ -199,8 +214,13 @@ public class MainActivity extends AppCompatActivity {
         int yRow = image.getPlanes()[0].getRowStride();
         int uvRow = image.getPlanes()[1].getRowStride();
         int uvPix = image.getPlanes()[1].getPixelStride();
+        int vRow = image.getPlanes()[2].getRowStride();
+        int vPix = image.getPlanes()[2].getPixelStride();
         int ySize = w * h;
-        byte[] out = new byte[ySize + w * h / 2];
+        int need = ySize + w * h / 2;
+        if (nv21Buf == null || nv21Buf.length < need) nv21Buf = new byte[need];
+        byte[] out = nv21Buf;
+
         yB.rewind();
         if (yRow == w) {
             yB.get(out, 0, ySize);
@@ -213,13 +233,29 @@ public class MainActivity extends AppCompatActivity {
         int pos = ySize;
         for (int y = 0; y < h / 2; y++) {
             for (int x = 0; x < w / 2; x++) {
+                int vOff = y * vRow + x * vPix;
                 int uOff = y * uvRow + x * uvPix;
-                int vOff = y * image.getPlanes()[2].getRowStride() + x * image.getPlanes()[2].getPixelStride();
                 out[pos++] = vB.get(vOff);
                 out[pos++] = uB.get(uOff);
             }
         }
         return out;
+    }
+
+    private void updateHeart() {
+        long since = (System.currentTimeMillis() - lastDecodeTs) / 1000;
+        final String txt = "帧 " + frameCount + " · 最近解码 " + since + "s前";
+        runUi(() -> tvHeart.setText(txt));
+    }
+
+    private void runUi(Runnable r) {
+        runOnUiThread(r);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (analyzerExecutor != null) analyzerExecutor.shutdown();
     }
 
     @Override
@@ -269,7 +305,7 @@ public class MainActivity extends AppCompatActivity {
                 lastRaw = s;
                 saveState();
                 toast("文件名分片已收");
-                tvStatus.setText("文件名: " + rxName + "  (共 " + total + " 片)");
+                runUi(() -> tvStatus.setText("文件名: " + rxName + "  (共 " + total + " 片)"));
             } else {
                 int i = c.getInt("t");          // 总分片数
                 int idx = c.getInt("i");         // 分片索引
@@ -296,11 +332,12 @@ public class MainActivity extends AppCompatActivity {
                 lastRaw = s;
                 saveState();
                 int got = chunks.size();
-                tvStatus.setText("已收 " + (idx + 1) + "/" + total
-                        + " 片   下一待收第 " + (got + 1) + " 片");
+                int fi = idx, ft = total, fg = got;
+                runUi(() -> tvStatus.setText("已收 " + (fi + 1) + "/" + ft
+                        + " 片   下一待收第 " + (fg + 1) + " 片"));
                 toast("收到分片 " + (idx + 1) + "/" + total);
             }
-            updateUI();
+            runUi(this::updateUI);
             checkDone();
         } catch (Exception e) {
             toast("处理失败", true);
@@ -309,7 +346,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void checkDone() {
         if (fnChunk != null && total > 0 && chunks.size() >= total) {
-            tvStatus.setText("全部收齐，正在重组…");
+            runUi(() -> tvStatus.setText("全部收齐，正在重组…"));
             new Thread(this::assemble).start();
         }
     }
@@ -317,7 +354,7 @@ public class MainActivity extends AppCompatActivity {
     // ===== 重组：Base45 解码 -> zlib 解压 -> 存文件 =====
     private void assemble() {
         try {
-            ByteArrayOutputStream all = new ByteArrayOutputStream();
+            java.io.ByteArrayOutputStream all = new java.io.ByteArrayOutputStream();
             for (int i = 0; i < total; i++) {
                 String d = chunks.get(i);
                 if (d == null) throw new Exception("缺少分片" + (i + 1));
@@ -327,7 +364,7 @@ public class MainActivity extends AppCompatActivity {
             lastFile = out;
             final String info = "文件名: " + rxName + "\n大小: " + fmt(out.length)
                     + "\n类型: " + ftype(rxName) + "\n分片数: " + total;
-            runOnUiThread(() -> {
+            runUi(() -> {
                 tvStatus.setText("重组完成");
                 tvInfo.setText(info);
                 btnSave.setEnabled(true);
@@ -336,7 +373,7 @@ public class MainActivity extends AppCompatActivity {
             });
             saveFile(out, rxName);
         } catch (Exception e) {
-            runOnUiThread(() -> toast("重组失败: " + e.getMessage(), true));
+            runUi(() -> toast("重组失败: " + e.getMessage(), true));
         }
     }
 
@@ -382,7 +419,7 @@ public class MainActivity extends AppCompatActivity {
         final String A = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
         int[] alph = new int[128];
         for (int k = 0; k < A.length(); k++) alph[A.charAt(k)] = k;
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
         int i = 0;
         while (i < s.length()) {
             int c0 = alph[s.charAt(i)];
@@ -408,7 +445,7 @@ public class MainActivity extends AppCompatActivity {
     private static byte[] inflate(byte[] comp) throws Exception {
         Inflater inf = new Inflater();   // zlib 格式（pako 默认）
         inf.setInput(comp);
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         byte[] buf = new byte[8192];
         try {
             while (!inf.finished()) {
