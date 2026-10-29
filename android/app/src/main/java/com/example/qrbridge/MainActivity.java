@@ -13,6 +13,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.util.Size;
 import android.provider.MediaStore;
 import android.widget.Button;
 import android.widget.HorizontalScrollView;
@@ -71,6 +72,8 @@ public class MainActivity extends AppCompatActivity {
     private Button btnClear, btnSave;
 
     private final MultiFormatReader reader = new MultiFormatReader();
+    private final EnumMap<DecodeHintType, Object> hintsFast = new EnumMap<>(DecodeHintType.class);
+    private final EnumMap<DecodeHintType, Object> hintsHard = new EnumMap<>(DecodeHintType.class);
     private long lastScan = 0;
 
     private final Map<Integer, String> chunks = new HashMap<>();
@@ -100,6 +103,9 @@ public class MainActivity extends AppCompatActivity {
         EnumMap<DecodeHintType, Object> hints = new EnumMap<>(DecodeHintType.class);
         hints.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
         reader.setHints(hints);
+        hintsFast.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
+        hintsHard.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
+        hintsHard.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
 
         loadState();
         updateUI();
@@ -128,6 +134,7 @@ public class MainActivity extends AppCompatActivity {
                     preview.setSurfaceProvider(previewView.getSurfaceProvider());
 
                     ImageAnalysis analysis = new ImageAnalysis.Builder()
+                            .setTargetResolution(new Size(1280, 960))
                             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                             .build();
                     analysis.setAnalyzer(ex, this::decodeFrame);
@@ -149,30 +156,34 @@ public class MainActivity extends AppCompatActivity {
 
     private void decodeFrame(ImageProxy image) {
         long now = System.currentTimeMillis();
-        if (now - lastScan < 160) {
+        if (now - lastScan < 120) {
             image.close();
             return;
         }
         lastScan = now;
         try {
-            byte[] nv21 = yuv420ToNV21(image);
             int w = image.getWidth(), h = image.getHeight();
-            YuvImage yuv = new YuvImage(nv21, ImageFormat.NV21, w, h, null);
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            yuv.compressToJpeg(new Rect(0, 0, w, h), 90, baos);
-            Bitmap bmp = BitmapFactory.decodeByteArray(baos.toByteArray(), 0, baos.size());
-            if (bmp != null) {
-                int[] px = new int[w * h];
-                bmp.getPixels(px, 0, w, 0, 0, w, h);
-                RGBLuminanceSource src = new RGBLuminanceSource(w, h, px);
-                BinaryBitmap bb = new BinaryBitmap(new HybridBinarizer(src));
+            byte[] nv21 = yuv420ToNV21(image);
+            int ySize = w * h;
+            // 二维码是灰度图，只需亮度通道：直接从 Y 平面构造灰度，避免 JPEG 有损压缩糊掉高密度码
+            int[] px = new int[ySize];
+            for (int i = 0; i < ySize; i++) {
+                int Y = nv21[i] & 0xff;
+                px[i] = (0xff000000) | (Y << 16) | (Y << 8) | Y;
+            }
+            RGBLuminanceSource src = new RGBLuminanceSource(w, h, px);
+            // 先快速解；失败再用 TRY_HARDER 兜底（高密度码必备）
+            try {
+                Result r = reader.decode(new BinaryBitmap(new HybridBinarizer(src)), hintsFast);
+                String t = r.getText();
+                if (t != null && !t.isEmpty()) handle(t);
+            } catch (Exception e1) {
                 try {
-                    Result r = reader.decodeWithState(bb);
+                    Result r = reader.decode(new BinaryBitmap(new HybridBinarizer(src)), hintsHard);
                     String t = r.getText();
                     if (t != null && !t.isEmpty()) handle(t);
                 } catch (Exception ignore) {
                 }
-                bmp.recycle();
             }
         } catch (Exception ignore) {
         } finally {
