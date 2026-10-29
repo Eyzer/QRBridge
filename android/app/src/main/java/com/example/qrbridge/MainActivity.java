@@ -8,6 +8,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.widget.Button;
 import android.widget.HorizontalScrollView;
@@ -58,7 +59,7 @@ import java.util.zip.Inflater;
 public class MainActivity extends AppCompatActivity {
 
     private static final int CAMERA_REQ = 100;
-    private static final String BUILD = "v1.4";
+    private static final String BUILD = "v1.5";
 
     private PreviewView previewView;
     private TextView tvStatus, tvFp, tvProgress, tvInfo, tvHeart, tvLast;
@@ -73,11 +74,16 @@ public class MainActivity extends AppCompatActivity {
 
     // 后台单线程执行分析，避免阻塞相机/主线程导致部分机型（如 VIVO/originOS）停止送帧
     private ExecutorService analyzerExecutor;
-    private byte[] nv21Buf = null;            // 复用的 YUV 缓冲，避免每帧分配 4.8MB
+    private byte[] lumaBuf = null;            // 复用的 Y 平面缓冲（只用亮度，不拷色度）
+    private byte[] smallBuf = null;           // 降采样后的缓冲
+    private int smallW = 0, smallH = 0;
     private long frameCount = 0;
     private long lastFrameTs = 0;
     private long lastDecodeTs = 0;
     private long decodedCount = 0;
+    private long lastHeavyTs = 0;             // 上次做“重解”（TRY_HARDER 等）的时间
+    private long lastFrameMs = 0;             // 单帧分析耗时，用于诊断
+    private long lastHeartUi = 0;
     private int lastFrameW = 0, lastFrameH = 0;
 
     private final Map<Integer, String> chunks = new HashMap<>();
@@ -144,8 +150,10 @@ public class MainActivity extends AppCompatActivity {
                     CameraSelector sel = new CameraSelector.Builder()
                             .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                             .build();
-                    // 逐级尝试：超高分辨率优先（高密度码需要更多像素/模块），失败自动降级
-                    int[][] sizes = {{2560, 1920}, {1920, 1440}, {1280, 960}};
+                    // 分析分辨率必须压在 100 万像素级：2448x2448 那种全尺寸每帧解码要几秒，
+                    // 会把分析线程拖到 0.2 帧/秒，连最简单的一张码都扫不出来。
+                    // 高密度码的余量交给“降采样到 1280 + 多路重解”来补，不靠堆分辨率。
+                    int[][] sizes = {{1280, 960}, {1024, 768}, {960, 720}, {640, 480}};
                     Exception lastErr = null;
                     for (int[] sz : sizes) {
                         try {
@@ -175,41 +183,46 @@ public class MainActivity extends AppCompatActivity {
 
     // 关键修复：立刻关闭相机 ImageProxy（释放缓冲），再从本地副本解码，杜绝部分机型“送帧停摆”
     private void decodeFrame(ImageProxy image) {
-        long now = System.currentTimeMillis();
-        if (now - lastScan < 120) {
+        long t0 = SystemClock.elapsedRealtime();
+        if (t0 - lastScan < 70) {          // 限流，把 CPU 留给真正的解码
             image.close();
             return;
         }
-        lastScan = now;
-        frameCount++;
-        lastFrameTs = now;
+        lastScan = t0;
 
-        byte[] data;
+        byte[] luma;
         int w, h;
         try {
             w = image.getWidth();
             h = image.getHeight();
             lastFrameW = w;
             lastFrameH = h;
-            data = yuv420ToNV21(image);   // 写入复用缓冲，不每帧 new 大数组
+            luma = readLuma(image);        // 只拷 Y 平面（解码只用亮度）
         } catch (Exception e) {
             image.close();
-            updateHeart();
             return;
         }
-        image.close();   // 立即释放相机缓冲
+        image.close();                     // 立即释放相机缓冲，杜绝送帧停摆
+
+        frameCount++;
+        long now = System.currentTimeMillis();
 
         try {
-            PlanarYUVLuminanceSource src = new PlanarYUVLuminanceSource(
-                    data, w, h, 0, 0, w, h, false);
-            // 多路兜底：快速(Hybrid) -> TRY_HARDER(Hybrid) -> TRY_HARDER(GlobalHistogram, 抗反光/渐变)
-            if (!tryDecode(src, false, false)) {
-                if (!tryDecode(src, true, false)) {
-                    tryDecode(src, true, true);
-                }
+            // 大画面先盒式降采样：帧率（能否扫到）比像素数更关键
+            byte[] data = downscale(luma, w, h);
+            int dw = smallW, dh = smallH;
+            PlanarYUVLuminanceSource src = new PlanarYUVLuminanceSource(data, dw, dh, 0, 0, dw, dh, false);
+
+            boolean ok = tryDecode(src, false, false);      // 每帧都做：便宜的快解
+            if (!ok && (now - lastHeavyTs) >= 400) {        // 每 400ms 才做一次重解，保住帧率
+                lastHeavyTs = now;
+                ok = tryDecode(src, true, false)            // TRY_HARDER + 反色
+                        || tryDecodeCrop(data, dw, dh)      // 中间 80% 裁切（码占满画面时更准）
+                        || tryDecode(src, true, true);      // GlobalHistogram，抗屏幕反光/渐变
             }
         } catch (Exception ignore) {
         }
+        lastFrameMs = SystemClock.elapsedRealtime() - t0;
         updateHeart();
     }
 
@@ -224,6 +237,88 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception ignore) {
         }
         return false;
+    }
+
+    // 裁切中间 80% 再解：背景干净、模块更集中，对“码贴在屏幕上”的场景命中率更高
+    private boolean tryDecodeCrop(byte[] data, int w, int h) {
+        try {
+            int cw = Math.max(64, w * 80 / 100);
+            int ch = Math.max(64, h * 80 / 100);
+            int cl = (w - cw) / 2, ct = (h - ch) / 2;
+            PlanarYUVLuminanceSource crop = new PlanarYUVLuminanceSource(data, w, h, cl, ct, cw, ch, false);
+            return tryDecode(crop, false, false) || tryDecode(crop, true, false);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // 只取 Y（亮度）平面：解码用不到色度，省掉一半拷贝和大量 ByteBuffer.get
+    private byte[] readLuma(ImageProxy image) {
+        ImageProxy.PlaneProxy yp = image.getPlanes()[0];
+        ByteBuffer b = yp.getBuffer();
+        int w = image.getWidth(), h = image.getHeight();
+        int rowStride = yp.getRowStride();
+        int pixStride = yp.getPixelStride();
+        int need = w * h;
+        if (lumaBuf == null || lumaBuf.length < need) lumaBuf = new byte[need];
+        byte[] out = lumaBuf;
+        int limit = b.limit();
+        if (pixStride == 1 && rowStride == w && limit >= need) {
+            b.position(0);
+            b.get(out, 0, need);
+        } else if (pixStride == 1) {
+            int pos = 0;
+            for (int y = 0; y < h; y++) {
+                int p = y * rowStride;
+                if (p + w > limit) break;
+                b.position(p);
+                b.get(out, pos, w);
+                pos += w;
+            }
+        } else {
+            int pos = 0;
+            for (int y = 0; y < h; y++) {
+                int base = y * rowStride;
+                for (int x = 0; x < w; x++) {
+                    int p = base + x * pixStride;
+                    out[pos++] = p < limit ? b.get(p) : (byte) 0xff;
+                }
+            }
+        }
+        return out;
+    }
+
+    // 盒式平均降采样：最长边压到 1280 以内，兼顾“每模块像素够”与“解码够快”
+    private byte[] downscale(byte[] src, int w, int h) {
+        int maxSide = Math.max(w, h);
+        int f = 1;
+        while (maxSide / f > 1280) f++;
+        if (f <= 1) {
+            smallW = w;
+            smallH = h;
+            return src;
+        }
+        int dw = w / f, dh = h / f;
+        int need = dw * dh;
+        if (smallBuf == null || smallBuf.length < need) smallBuf = new byte[need];
+        byte[] out = smallBuf;
+        int area = f * f;
+        for (int y = 0; y < dh; y++) {
+            int sy0 = y * f;
+            int rowOut = y * dw;
+            for (int x = 0; x < dw; x++) {
+                int sx0 = x * f;
+                int sum = 0;
+                for (int dy = 0; dy < f; dy++) {
+                    int base = (sy0 + dy) * w + sx0;
+                    for (int dx = 0; dx < f; dx++) sum += src[base + dx] & 0xff;
+                }
+                out[rowOut + x] = (byte) (sum / area);
+            }
+        }
+        smallW = dw;
+        smallH = dh;
+        return out;
     }
 
     private void onResult(Result r) {
@@ -247,47 +342,13 @@ public class MainActivity extends AppCompatActivity {
         handle(t);
     }
 
-    // YUV420 -> NV21（复用 nv21Buf），Y 平面 stride 规整为 w，兼容各类机型
-    private byte[] yuv420ToNV21(ImageProxy image) {
-        int w = image.getWidth(), h = image.getHeight();
-        ByteBuffer yB = image.getPlanes()[0].getBuffer();
-        ByteBuffer uB = image.getPlanes()[1].getBuffer();
-        ByteBuffer vB = image.getPlanes()[2].getBuffer();
-        int yRow = image.getPlanes()[0].getRowStride();
-        int uvRow = image.getPlanes()[1].getRowStride();
-        int uvPix = image.getPlanes()[1].getPixelStride();
-        int vRow = image.getPlanes()[2].getRowStride();
-        int vPix = image.getPlanes()[2].getPixelStride();
-        int ySize = w * h;
-        int need = ySize + w * h / 2;
-        if (nv21Buf == null || nv21Buf.length < need) nv21Buf = new byte[need];
-        byte[] out = nv21Buf;
-
-        yB.rewind();
-        if (yRow == w) {
-            yB.get(out, 0, ySize);
-        } else {
-            for (int y = 0; y < h; y++) {
-                yB.get(out, y * w, w);
-                yB.position(Math.min(yB.limit(), yB.position() + (yRow - w)));
-            }
-        }
-        int pos = ySize;
-        for (int y = 0; y < h / 2; y++) {
-            for (int x = 0; x < w / 2; x++) {
-                int vOff = y * vRow + x * vPix;
-                int uOff = y * uvRow + x * uvPix;
-                out[pos++] = vB.get(vOff);
-                out[pos++] = uB.get(uOff);
-            }
-        }
-        return out;
-    }
-
     private void updateHeart() {
-        long since = (System.currentTimeMillis() - lastDecodeTs) / 1000;
+        long now = System.currentTimeMillis();
+        if (now - lastHeartUi < 250) return;      // 别让 UI 刷新反过来拖慢分析线程
+        lastHeartUi = now;
+        long since = lastDecodeTs == 0 ? -1 : (now - lastDecodeTs) / 1000;
         final String txt = "帧 " + frameCount + " · " + lastFrameW + "x" + lastFrameH
-                + " · 解码" + since + "s前 · " + BUILD;
+                + " · 解码" + (since < 0 ? "—" : since + "s") + "前 · " + lastFrameMs + "ms/帧 · " + BUILD;
         runUi(() -> tvHeart.setText(txt));
     }
 
