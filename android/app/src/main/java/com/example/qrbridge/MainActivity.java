@@ -59,7 +59,7 @@ import java.util.zip.Inflater;
 public class MainActivity extends AppCompatActivity {
 
     private static final int CAMERA_REQ = 100;
-    private static final String BUILD = "v1.5";
+    private static final String BUILD = "v1.6";
 
     private PreviewView previewView;
     private TextView tvStatus, tvFp, tvProgress, tvInfo, tvHeart, tvLast;
@@ -460,29 +460,64 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // ===== 重组：Base45 解码 -> zlib 解压 -> 存文件 =====
+    // 两套发送端的 Base45 字节序不同（原版 send.html 低位在前；EyHub/RFC 9285 高位在前），
+    // 所以这里两种顺序都试，再看哪种能 inflate 成功——不猜。
     private void assemble() {
-        try {
-            java.io.ByteArrayOutputStream all = new java.io.ByteArrayOutputStream();
-            for (int i = 0; i < total; i++) {
-                String d = chunks.get(i);
-                if (d == null) throw new Exception("缺少分片" + (i + 1));
-                all.write(base45Decode(d));
+        String lastMsg = "";
+        byte[] head = null;
+        for (int order = 0; order < 2; order++) {
+            boolean rfc = (order == 1);
+            try {
+                java.io.ByteArrayOutputStream all = new java.io.ByteArrayOutputStream();
+                for (int i = 0; i < total; i++) {
+                    String d = chunks.get(i);
+                    if (d == null) throw new Exception("缺少分片" + (i + 1));
+                    all.write(base45Decode(d, rfc));
+                }
+                byte[] comp = all.toByteArray();
+                if (comp.length < 4) throw new Exception("数据过短");
+                if (head == null) head = new byte[]{comp[0], comp[1], comp[2], comp[3]};
+
+                byte[] out = null;
+                Exception e1 = null;
+                try {
+                    out = inflate(comp, false);      // zlib 头（pako.deflate 默认）
+                } catch (Exception ex) {
+                    e1 = ex;
+                    out = inflate(comp, true);       // 裸 deflate 兜底
+                }
+                if (out == null || out.length == 0) throw new Exception(e1 != null ? e1.getMessage() : "解压为空");
+                // 长度自校验：错序解码有时能“解出”垃圾而不抛异常，用名片里的原始大小兜住
+                if (rxSize > 0 && out.length != rxSize) {
+                    throw new Exception("长度不符 " + out.length + "/" + rxSize);
+                }
+
+                lastFile = out;
+                final String info = "文件名: " + rxName + "\n大小: " + fmt(out.length)
+                        + "\n类型: " + ftype(rxName) + "\n分片数: " + total
+                        + "\nBase45 字节序: " + (rfc ? "高位在前(RFC)" : "低位在前(原版)");
+                final byte[] saved = out;
+                runUi(() -> {
+                    tvStatus.setText("重组完成");
+                    tvInfo.setText(info);
+                    btnSave.setEnabled(true);
+                    btnSave.setVisibility(android.view.View.VISIBLE);
+                });
+                saveFile(saved, rxName);
+                toast("重组完成，已保存");
+                return;
+            } catch (Exception e) {
+                lastMsg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             }
-            byte[] out = inflate(all.toByteArray());
-            lastFile = out;
-            final String info = "文件名: " + rxName + "\n大小: " + fmt(out.length)
-                    + "\n类型: " + ftype(rxName) + "\n分片数: " + total;
-            runUi(() -> {
-                tvStatus.setText("重组完成");
-                tvInfo.setText(info);
-                btnSave.setEnabled(true);
-                btnSave.setVisibility(android.view.View.VISIBLE);
-                toast("重组完成，已可保存");
-            });
-            saveFile(out, rxName);
-        } catch (Exception e) {
-            runUi(() -> toast("重组失败: " + e.getMessage(), true));
         }
+        final String msg = lastMsg + (head == null ? "" : " 头字节=" + hex(head));
+        runUi(() -> toast("重组失败: " + msg, true));
+    }
+
+    private static String hex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        for (byte x : b) sb.append(String.format("%02X", x));
+        return sb.toString();
     }
 
     private void saveFile(byte[] data, String name) {
@@ -523,7 +558,9 @@ public class MainActivity extends AppCompatActivity {
         return s.substring(s.length() - 5);
     }
 
-    private static byte[] base45Decode(String s) {
+    // rfc=false：低位在前（原版 send.html / v3 单文件版）
+    // rfc=true ：高位在前（RFC 9285 / EyHub qrBridge.js）
+    private static byte[] base45Decode(String s, boolean rfc) {
         final String A = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
         int[] alph = new int[128];
         for (int k = 0; k < A.length(); k++) alph[A.charAt(k)] = k;
@@ -535,13 +572,18 @@ public class MainActivity extends AppCompatActivity {
                 int c1 = alph[s.charAt(i + 1)];
                 int c2 = alph[s.charAt(i + 2)];
                 int val = c0 + c1 * 45 + c2 * 45 * 45;
-                out.write(val & 0xFF);
-                out.write((val >> 8) & 0xFF);
+                if (rfc) {
+                    out.write((val >> 8) & 0xFF);
+                    out.write(val & 0xFF);
+                } else {
+                    out.write(val & 0xFF);
+                    out.write((val >> 8) & 0xFF);
+                }
                 i += 3;
             } else if (i + 1 < s.length()) {
                 int c1 = alph[s.charAt(i + 1)];
                 int val = c0 + c1 * 45;
-                out.write(val & 0xFF);
+                out.write(val & 0xFF);      // 单字节组两种序一致
                 i += 2;
             } else {
                 throw new IllegalArgumentException("Base45 长度错误");
@@ -550,8 +592,8 @@ public class MainActivity extends AppCompatActivity {
         return out.toByteArray();
     }
 
-    private static byte[] inflate(byte[] comp) throws Exception {
-        Inflater inf = new Inflater();   // zlib 格式（pako 默认）
+    private static byte[] inflate(byte[] comp, boolean raw) throws Exception {
+        Inflater inf = new Inflater(raw);   // raw=true 时按裸 deflate 处理
         inf.setInput(comp);
         java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
         byte[] buf = new byte[8192];
