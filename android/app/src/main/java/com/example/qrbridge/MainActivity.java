@@ -28,11 +28,13 @@ import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 
 import com.google.zxing.BarcodeFormat;
+import com.google.zxing.Binarizer;
 import com.google.zxing.BinaryBitmap;
 import com.google.zxing.DecodeHintType;
 import com.google.zxing.MultiFormatReader;
 import com.google.zxing.PlanarYUVLuminanceSource;
 import com.google.zxing.Result;
+import com.google.zxing.common.GlobalHistogramBinarizer;
 import com.google.zxing.common.HybridBinarizer;
 
 import org.json.JSONArray;
@@ -58,7 +60,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int CAMERA_REQ = 100;
 
     private PreviewView previewView;
-    private TextView tvStatus, tvFp, tvProgress, tvInfo, tvHeart;
+    private TextView tvStatus, tvFp, tvProgress, tvInfo, tvHeart, tvLast;
     private ProgressBar bar;
     private LinearLayout grid;
     private Button btnClear, btnSave;
@@ -74,6 +76,7 @@ public class MainActivity extends AppCompatActivity {
     private long frameCount = 0;
     private long lastFrameTs = 0;
     private long lastDecodeTs = 0;
+    private long decodedCount = 0;
 
     private final Map<Integer, String> chunks = new HashMap<>();
     private String fp = null;
@@ -95,6 +98,7 @@ public class MainActivity extends AppCompatActivity {
         tvProgress = findViewById(R.id.tv_progress);
         tvInfo = findViewById(R.id.tv_info);
         tvHeart = findViewById(R.id.tv_heart);
+        tvLast = findViewById(R.id.tv_last);
         bar = findViewById(R.id.bar);
         grid = findViewById(R.id.grid);
         btnClear = findViewById(R.id.btn_clear);
@@ -106,6 +110,7 @@ public class MainActivity extends AppCompatActivity {
         hintsFast.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
         hintsHard.put(DecodeHintType.POSSIBLE_FORMATS, Collections.singletonList(BarcodeFormat.QR_CODE));
         hintsHard.put(DecodeHintType.TRY_HARDER, Boolean.TRUE);
+        hintsHard.put(DecodeHintType.ALSO_INVERTED, Boolean.TRUE);
 
         loadState();
         updateUI();
@@ -134,18 +139,29 @@ public class MainActivity extends AppCompatActivity {
                     Preview preview = new Preview.Builder().build();
                     preview.setSurfaceProvider(previewView.getSurfaceProvider());
 
-                    ImageAnalysis analysis = new ImageAnalysis.Builder()
-                            .setTargetResolution(new android.util.Size(1280, 960))
-                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                            .build();
-                    analysis.setAnalyzer(analyzerExecutor, this::decodeFrame);
-
                     CameraSelector sel = new CameraSelector.Builder()
                             .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                             .build();
-                    provider.unbindAll();
-                    provider.bindToLifecycle(this, sel, preview, analysis);
-                    runUi(() -> tvStatus.setText("对准二维码"));
+                    // 先尝试高分辨率（高密度码需要更多像素/模块），失败再退回 1280x960
+                    int[][] sizes = {{1920, 1440}, {1280, 960}};
+                    Exception lastErr = null;
+                    for (int[] sz : sizes) {
+                        try {
+                            ImageAnalysis analysis = new ImageAnalysis.Builder()
+                                    .setTargetResolution(new android.util.Size(sz[0], sz[1]))
+                                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                                    .build();
+                            analysis.setAnalyzer(analyzerExecutor, this::decodeFrame);
+                            provider.unbindAll();
+                            provider.bindToLifecycle(this, sel, preview, analysis);
+                            runUi(() -> tvStatus.setText("对准二维码 (" + sz[0] + "x" + sz[1] + ")"));
+                            lastErr = null;
+                            break;
+                        } catch (Exception e) {
+                            lastErr = e;
+                        }
+                    }
+                    if (lastErr != null) throw lastErr;
                 } catch (Exception e) {
                     toast("相机启动失败: " + e.getMessage(), true);
                 }
@@ -182,14 +198,10 @@ public class MainActivity extends AppCompatActivity {
         try {
             PlanarYUVLuminanceSource src = new PlanarYUVLuminanceSource(
                     data, w, h, 0, 0, w, h, false);
-            try {
-                Result r = reader.decode(new BinaryBitmap(new HybridBinarizer(src)), hintsFast);
-                onResult(r);
-            } catch (Exception e1) {
-                try {
-                    Result r = reader.decode(new BinaryBitmap(new HybridBinarizer(src)), hintsHard);
-                    onResult(r);
-                } catch (Exception ignore) {
+            // 多路兜底：快速(Hybrid) -> TRY_HARDER(Hybrid) -> TRY_HARDER(GlobalHistogram, 抗反光/渐变)
+            if (!tryDecode(src, false, false)) {
+                if (!tryDecode(src, true, false)) {
+                    tryDecode(src, true, true);
                 }
             }
         } catch (Exception ignore) {
@@ -197,12 +209,38 @@ public class MainActivity extends AppCompatActivity {
         updateHeart();
     }
 
+    private boolean tryDecode(PlanarYUVLuminanceSource src, boolean harder, boolean global) {
+        try {
+            Binarizer bin = global ? new GlobalHistogramBinarizer(src) : new HybridBinarizer(src);
+            Result r = reader.decode(new BinaryBitmap(bin), harder ? hintsHard : hintsFast);
+            if (r != null && r.getText() != null && !r.getText().isEmpty()) {
+                onResult(r);
+                return true;
+            }
+        } catch (Exception ignore) {
+        }
+        return false;
+    }
+
     private void onResult(Result r) {
         String t = r.getText();
-        if (t != null && !t.isEmpty()) {
-            lastDecodeTs = System.currentTimeMillis();
-            handle(t);
+        if (t == null || t.isEmpty()) return;
+        lastDecodeTs = System.currentTimeMillis();
+        decodedCount++;
+        // 诊断：显示解出的分片 i / t 与长度，便于判断是“没解出”还是“解出被去重/拒绝”
+        String diag = "解码#" + decodedCount + " len=" + t.length();
+        try {
+            int a = t.indexOf('{');
+            int z = t.lastIndexOf('}');
+            if (a >= 0 && z > a) {
+                JSONObject o = new JSONObject(t.substring(a, z + 1));
+                diag += " i=" + o.optInt("i", -1) + " t=" + o.optInt("t", -1);
+            }
+        } catch (Exception ignore) {
         }
+        final String d = diag;
+        runUi(() -> tvLast.setText(d));
+        handle(t);
     }
 
     // YUV420 -> NV21（复用 nv21Buf），Y 平面 stride 规整为 w，兼容各类机型
@@ -345,7 +383,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void checkDone() {
-        if (fnChunk != null && total > 0 && chunks.size() >= total) {
+        if (total > 0 && chunks.size() >= total) {
+            if (fnChunk == null) {
+                runUi(() -> tvStatus.setText("数据已齐，请扫最后一张「文件名」二维码"));
+                return;
+            }
             runUi(() -> tvStatus.setText("全部收齐，正在重组…"));
             new Thread(this::assemble).start();
         }
