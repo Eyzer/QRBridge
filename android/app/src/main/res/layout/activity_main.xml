@@ -9,7 +9,7 @@
     <TextView
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="二维码文件接收端"
+        android:text="二维码文件接收端  v1.4"
         android:textColor="#ffffff"
         android:textSize="20sp"
         android:textStyle="bold"

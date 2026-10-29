@@ -58,6 +58,7 @@ import java.util.zip.Inflater;
 public class MainActivity extends AppCompatActivity {
 
     private static final int CAMERA_REQ = 100;
+    private static final String BUILD = "v1.4";
 
     private PreviewView previewView;
     private TextView tvStatus, tvFp, tvProgress, tvInfo, tvHeart, tvLast;
@@ -77,6 +78,7 @@ public class MainActivity extends AppCompatActivity {
     private long lastFrameTs = 0;
     private long lastDecodeTs = 0;
     private long decodedCount = 0;
+    private int lastFrameW = 0, lastFrameH = 0;
 
     private final Map<Integer, String> chunks = new HashMap<>();
     private String fp = null;
@@ -142,8 +144,8 @@ public class MainActivity extends AppCompatActivity {
                     CameraSelector sel = new CameraSelector.Builder()
                             .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                             .build();
-                    // 先尝试高分辨率（高密度码需要更多像素/模块），失败再退回 1280x960
-                    int[][] sizes = {{1920, 1440}, {1280, 960}};
+                    // 逐级尝试：超高分辨率优先（高密度码需要更多像素/模块），失败自动降级
+                    int[][] sizes = {{2560, 1920}, {1920, 1440}, {1280, 960}};
                     Exception lastErr = null;
                     for (int[] sz : sizes) {
                         try {
@@ -187,6 +189,8 @@ public class MainActivity extends AppCompatActivity {
         try {
             w = image.getWidth();
             h = image.getHeight();
+            lastFrameW = w;
+            lastFrameH = h;
             data = yuv420ToNV21(image);   // 写入复用缓冲，不每帧 new 大数组
         } catch (Exception e) {
             image.close();
@@ -282,7 +286,8 @@ public class MainActivity extends AppCompatActivity {
 
     private void updateHeart() {
         long since = (System.currentTimeMillis() - lastDecodeTs) / 1000;
-        final String txt = "帧 " + frameCount + " · 最近解码 " + since + "s前";
+        final String txt = "帧 " + frameCount + " · " + lastFrameW + "x" + lastFrameH
+                + " · 解码" + since + "s前 · " + BUILD;
         runUi(() -> tvHeart.setText(txt));
     }
 
